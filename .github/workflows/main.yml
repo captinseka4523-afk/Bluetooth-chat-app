@@ -1,4 +1,4 @@
-name: Build BlueChat APK
+name: Build BlueChat Elite APK
 
 on:
   push:
@@ -45,7 +45,7 @@ jobs:
                   android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2z"/>
               <path
                   android:fillColor="#FFFFFF"
-                  android:pathData="M17.71,7.71L12,2h-1v7.59L6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 11,14.41V22h1l5.71,-5.71 -4.3,-4.29 4.3,-4.29zM13,5.83l1.88,1.88L13,9.59V5.83zm1.88,10.46L13,18.17v-3.76l1.88,1.88Z"/>
+                  android:pathData="M17.71,7.71L12,2h-1v7.59L6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 11,14.41V22h1l5.71,-5.71 -4.3,-4.29 4.3,-4.29zM13,5.83l1.88,1.88L13,9.59V5.83zm1.88,10.46L13,18.17v-3.76l1.88,1.88z"/>
           </vector>
           EOF
           fi
@@ -88,8 +88,8 @@ jobs:
                   applicationId "com.example.bluechat"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 3
+                  versionName "3.0"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -107,5 +107,5 @@ jobs:
       - name: Upload Ready APK
         uses: actions/upload-artifact@v4
         with:
-          name: BlueChat-Installable-APK
+          name: BlueChat-Elite-APK
           path: app/build/outputs/apk/debug/app-debug.apk
