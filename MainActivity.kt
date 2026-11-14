@@ -10,8 +10,10 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.*
 import android.provider.MediaStore
@@ -22,15 +24,14 @@ import android.widget.*
 import java.io.*
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CopyOnWriteArrayList
 
 @SuppressLint("MissingPermission")
 class MainActivity : Activity() {
 
     private lateinit var tvStatus: TextView
-    private lateinit var tvFavorite: TextView
-    private lateinit var btnListen: Button
-    private lateinit var btnConnect: Button
+    private lateinit var btnHostRoom: Button
+    private lateinit var btnScanDevices: Button
     private lateinit var btnSendText: Button
     private lateinit var btnSendImage: Button
     private lateinit var btnRecordAudio: Button
@@ -40,27 +41,27 @@ class MainActivity : Activity() {
     private lateinit var scrollView: ScrollView
 
     private var bluetoothAdapter: BluetoothAdapter? = null
-    private var connectedThread: ConnectedThread? = null
     private var acceptThread: AcceptThread? = null
     private var connectThread: ConnectThread? = null
+
+    private val clientThreads = CopyOnWriteArrayList<ConnectedThread>()
+    private var hostClientThread: ConnectedThread? = null
+
+    private val discoveredDeviceList = mutableListOf<BluetoothDevice>()
+    private val discoveredDeviceNames = mutableListOf<String>()
+    private lateinit var discoveryAdapter: ArrayAdapter<String>
 
     private var mediaRecorder: MediaRecorder? = null
     private var isRecording = false
     private var audioFilePath: String = ""
 
-    private lateinit var prefs: SharedPreferences
-    private var favDeviceAddress: String? = null
-    private var favDeviceName: String? = null
-    private var isAutoReconnecting = false
-    private val reconnectHandler = Handler(Looper.getMainLooper())
-
-    // طابور الرسائل المعلقة التي ترسل تلقائياً فور اتصال الجهاز المفضل
-    private data class QueuedPacket(val type: Byte, val fileName: String, val bytes: ByteArray)
-    private val pendingQueue = ConcurrentLinkedQueue<QueuedPacket>()
+    // لمعرفة ما إذا كان المستخدم داخل التطبيق أم خارجه
+    private var isAppInForeground = false
 
     private val APP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-    private val APP_NAME = "BlueChatPro"
-    private val CHANNEL_ID = "bluechat_alerts"
+    private val APP_NAME = "BlueChatElite"
+    private val CHANNEL_ID = "bluechat_elite_channel"
+    private val myDeviceName by lazy { android.os.Build.MODEL ?: "هاتف" }
 
     companion object {
         private const val REQ_PERMISSIONS = 100
@@ -75,13 +76,8 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefs = getSharedPreferences("BlueChatPrefs", Context.MODE_PRIVATE)
-        favDeviceAddress = prefs.getString("fav_address", null)
-        favDeviceName = prefs.getString("fav_name", null)
-
         createNotificationChannel()
-        setupProgrammaticUI()
-        updateFavoriteLabel()
+        setupGlassUI()
 
         val bluetoothManager = getSystemService(BluetoothManager::class.java)
         bluetoothAdapter = bluetoothManager?.adapter
@@ -94,70 +90,86 @@ class MainActivity : Activity() {
 
         requestAppPermissions()
         setupListeners()
+        registerBluetoothReceiver()
     }
 
-    private fun setupProgrammaticUI() {
+    override fun onResume() {
+        super.onResume()
+        isAppInForeground = true
+    }
+
+    override fun onPause() {
+        super.onPause()
+        isAppInForeground = false
+    }
+
+    // تصميم الجلاس ديزاين (Glassmorphism) الفاخر والألوان الأنيقة
+    private fun setupGlassUI() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0F172A"))
+            setBackgroundColor(Color.parseColor("#070A12"))
             setPadding(24, 24, 24, 24)
         }
 
+        // بطاقة الهيدر الزجاجية الفاخرة
         val topCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = createRoundedBg("#1E293B")
-            setPadding(24, 20, 24, 20)
+            background = createGlassBackground("#1A2238", 28f)
+            setPadding(24, 22, 24, 22)
+        }
+
+        val tvTitle = TextView(this).apply {
+            text = "⚡ BlueChat Elite"
+            setTextColor(Color.parseColor("#FFFFFF"))
+            textSize = 18f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 6)
         }
 
         tvStatus = TextView(this).apply {
-            text = "الحالة: غير متصل"
+            text = "الحالة: جاهز - أنشئ غرفة أو ابحث عن أجهزة"
             setTextColor(Color.parseColor("#38BDF8"))
-            textSize = 15f
-            gravity = Gravity.CENTER
-        }
-
-        tvFavorite = TextView(this).apply {
-            text = "⭐ الجهاز المفضل: لم يتم التحديد بعد"
-            setTextColor(Color.parseColor("#FBBF24"))
             textSize = 13f
             gravity = Gravity.CENTER
-            setPadding(0, 6, 0, 14)
+            setPadding(0, 0, 0, 16)
         }
 
-        val connButtonsRow = LinearLayout(this).apply {
+        val buttonsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
 
-        btnListen = Button(this).apply {
-            text = "فتح غرفة (هاتف 1)"
+        btnHostRoom = Button(this).apply {
+            text = "🏠 إنشاء غرفة"
             setTextColor(Color.WHITE)
-            background = createRoundedBg("#0284C7")
+            background = createGlassBackground("#0284C7", 20f)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = 10
+                marginEnd = 8
             }
         }
 
-        btnConnect = Button(this).apply {
-            text = "اتصال / مفضل (هاتف 2)"
+        btnScanDevices = Button(this).apply {
+            text = "🔍 بحث عن أجهزة"
             setTextColor(Color.WHITE)
-            background = createRoundedBg("#10B981")
+            background = createGlassBackground("#059669", 20f)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = 10
+                marginStart = 8
             }
         }
 
-        connButtonsRow.addView(btnListen)
-        connButtonsRow.addView(btnConnect)
+        buttonsRow.addView(btnHostRoom)
+        buttonsRow.addView(btnScanDevices)
+        topCard.addView(tvTitle)
         topCard.addView(tvStatus)
-        topCard.addView(tvFavorite)
-        topCard.addView(connButtonsRow)
+        topCard.addView(buttonsRow)
         root.addView(topCard, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { bottomMargin = 16 })
 
+        // صندوق المحادثة الزجاجي
         scrollView = ScrollView(this).apply {
-            background = createRoundedBg("#1E293B")
+            background = createGlassBackground("#0F172A", 28f)
             setPadding(20, 20, 20, 20)
         }
 
@@ -171,6 +183,7 @@ class MainActivity : Activity() {
             1f
         ).apply { bottomMargin = 16 })
 
+        // أزرار الوسائط المتعددة (صورة، صوت، ملف) بتصميم عصري
         val mediaRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
@@ -178,29 +191,24 @@ class MainActivity : Activity() {
         btnSendImage = Button(this).apply {
             text = "📷 صورة"
             setTextColor(Color.WHITE)
-            background = createRoundedBg("#8B5CF6")
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = 8
-            }
+            background = createGlassBackground("#7C3AED", 18f)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 6 }
         }
 
         btnRecordAudio = Button(this).apply {
-            text = "🎤 تسجيل صوت"
+            text = "🎤 صوت"
             setTextColor(Color.WHITE)
-            background = createRoundedBg("#EC4899")
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.3f).apply {
-                marginEnd = 8
-                marginStart = 8
+            background = createGlassBackground("#DB2777", 18f)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = 6; startMargin = 6
             }
         }
 
         btnSendFile = Button(this).apply {
             text = "📎 ملف"
             setTextColor(Color.WHITE)
-            background = createRoundedBg("#F59E0B")
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = 8
-            }
+            background = createGlassBackground("#D97706", 18f)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { startMargin = 6 }
         }
 
         mediaRow.addView(btnSendImage)
@@ -209,29 +217,30 @@ class MainActivity : Activity() {
         root.addView(mediaRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = 14 })
+        ).apply { bottomMargin = 12 })
 
+        // شريط كتابة الرسائل العصري
         val inputRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
         etMessage = EditText(this).apply {
-            hint = "اكتب رسالتك هنا..."
+            hint = "اكتب رسالة..."
             setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#94A3B8"))
-            background = createRoundedBg("#334155")
-            setPadding(28, 22, 28, 22)
+            setHintTextColor(Color.parseColor("#64748B"))
+            background = createGlassBackground("#1E293B", 22f)
+            setPadding(24, 20, 24, 20)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = 14
+                marginEnd = 12
             }
         }
 
         btnSendText = Button(this).apply {
-            text = "إرسال"
+            text = "إرسال ➔"
             setTextColor(Color.WHITE)
-            background = createRoundedBg("#2563EB")
-            setPadding(36, 22, 36, 22)
+            background = createGlassBackground("#2563EB", 22f)
+            setPadding(32, 20, 32, 20)
         }
 
         inputRow.addView(etMessage)
@@ -241,74 +250,54 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun createRoundedBg(hexColor: String): GradientDrawable {
+    // دالة إنشاء مظهر الجلاس ديزاين (شراشف زجاجية ناعمة مع حواف)
+    private fun createGlassBackground(hexColor: String, radius: Float): GradientDrawable {
         return GradientDrawable().apply {
-            cornerRadius = 24f
+            cornerRadius = radius
             setColor(Color.parseColor(hexColor))
-        }
-    }
-
-    private fun updateFavoriteLabel() {
-        runOnUiThread {
-            tvFavorite.text = if (favDeviceName != null) {
-                "⭐ الجهاز المفضل: $favDeviceName (يدعم الإرسال بالانتظار)"
-            } else {
-                "⭐ الجهاز المفضل: اختر جهازاً من (اتصال) لحفظه كمفضل"
-            }
+            setStroke(2, Color.parseColor("#334155")) // إطار زجاجي رفيع أنيق
         }
     }
 
     private fun setupListeners() {
-        btnListen.setOnClickListener {
+        btnHostRoom.setOnClickListener {
             if (requestAppPermissions()) startServer()
         }
 
-        btnConnect.setOnClickListener {
-            if (requestAppPermissions()) showPairedDevicesDialog()
+        btnScanDevices.setOnClickListener {
+            if (requestAppPermissions()) showInAppDiscoveryDialog()
         }
 
         btnSendText.setOnClickListener {
-            val msg = etMessage.text.toString().trim()
-            if (msg.isEmpty()) return@setOnClickListener
-            val bytes = msg.toByteArray(Charsets.UTF_8)
-
-            if (connectedThread != null) {
-                connectedThread?.sendPacket(TYPE_TEXT, "text.txt", bytes)
-                addTextBubble(msg, isSentByMe = true)
-                etMessage.text.clear()
-            } else if (favDeviceAddress != null) {
-                // حفظ الرسالة في طابور الانتظار وتشغيل الرادار التلقائي
-                pendingQueue.add(QueuedPacket(TYPE_TEXT, "text.txt", bytes))
-                addTextBubble("$msg\n⏳ (معلقة - ستصل فور فتح $favDeviceName للبلوتوث)", isSentByMe = true)
-                etMessage.text.clear()
-                startAutoReconnect()
-                promptWakeUpAlert(msg)
-            } else {
-                Toast.makeText(this, "اختر جهازاً مفضلاً أولاً من زر (اتصال)", Toast.LENGTH_LONG).show()
-            }
+            val text = etMessage.text.toString().trim()
+            if (text.isEmpty()) return@setOnClickListener
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            broadcastPacket(TYPE_TEXT, "text.txt", bytes)
+            addMessageBubble(myDeviceName, text, isSentByMe = true)
+            etMessage.text.clear()
         }
 
         btnSendImage.setOnClickListener {
-            if (connectedThread != null || favDeviceAddress != null) {
+            if (isConnectedAny()) {
                 val intent = Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*" }
                 startActivityForResult(Intent.createChooser(intent, "اختر صورة"), REQ_PICK_IMAGE)
             } else {
-                Toast.makeText(this, "يرجى تحديد جهاز مفضل أو الاتصال أولاً", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "أنشئ غرفة أو اتصل بجهاز أولاً", Toast.LENGTH_SHORT).show()
             }
         }
 
         btnSendFile.setOnClickListener {
-            if (connectedThread != null || favDeviceAddress != null) {
+            if (isConnectedAny()) {
                 val intent = Intent(Intent.ACTION_GET_CONTENT).apply { type = "*/*" }
                 startActivityForResult(Intent.createChooser(intent, "اختر ملفاً"), REQ_PICK_FILE)
             } else {
-                Toast.makeText(this, "يرجى تحديد جهاز مفضل أو الاتصال أولاً", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "أنشئ غرفة أو اتصل بجهاز أولاً", Toast.LENGTH_SHORT).show()
             }
         }
 
         btnRecordAudio.setOnClickListener {
-            if (connectedThread == null && favDeviceAddress == null) {
-                Toast.makeText(this, "يرجى تحديد جهاز مفضل أو الاتصال أولاً", Toast.LENGTH_SHORT).show()
+            if (!isConnectedAny()) {
+                Toast.makeText(this, "أنشئ غرفة أو اتصل بجهاز أولاً", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -319,122 +308,204 @@ class MainActivity : Activity() {
         }
     }
 
-    // نافذة إرسال إشعار إيقاظ للطرف الآخر عندما يكون البلوتوث لديه مطفأ
-    private fun promptWakeUpAlert(msgPreview: String) {
+    private fun isConnectedAny(): Boolean = clientThreads.isNotEmpty() || hostClientThread != null
+
+    private fun showInAppDiscoveryDialog() {
+        discoveredDeviceList.clear()
+        discoveredDeviceNames.clear()
+
+        bluetoothAdapter?.bondedDevices?.forEach {
+            discoveredDeviceList.add(it)
+            discoveredDeviceNames.add("⭐ مقترن: ${it.name ?: "جهاز"} (${it.address})")
+        }
+
+        discoveryAdapter = ArrayAdapter(this, android.R.layout.select_dialog_singlechoice, discoveredDeviceNames)
+
         AlertDialog.Builder(this)
-            .setTitle("الطرف الآخر غير متصل حالياً 🔔")
-            .setMessage("تم حفظ رسالتك في الانتظار وسيتم إرسالها تلقائياً بمجرد أن يفتح ($favDeviceName) البلوتوث.\n\nهل تريد إرسال (إشعار إيقاظ فوري) لهاتفه الآن لتنبيهه بفتح البلوتوث؟")
-            .setPositiveButton("نعم، أرسل تنبيه إيقاظ") { _, _ ->
-                try {
-                    val wakeIntent = Intent(Intent.ACTION_SENDTO).apply {
-                        data = Uri.parse("smsto:")
-                        putExtra("sms_body", "🔔 إشعار: أنا أحاول إرسال رسالة لك عبر تطبيق البلوتوث، يرجى تشغيل البلوتوث والاقتران بي لرؤية الرسالة!")
-                    }
-                    startActivity(wakeIntent)
-                } catch (e: Exception) {
-                    Toast.makeText(this, "تعذر فتح تطبيق الرسائل", Toast.LENGTH_SHORT).show()
-                }
+            .setTitle("اختر جهازاً للاتصال المباشر 🔍")
+            .setAdapter(discoveryAdapter) { _, which ->
+                val device = discoveredDeviceList[which]
+                bluetoothAdapter?.cancelDiscovery()
+                connectToDevice(device)
             }
-            .setNegativeButton("انتظار فتح البلوتوث تلقائياً", null)
+            .setPositiveButton("بحث عن أجهزة جديدة") { _, _ -> startDeviceDiscovery() }
+            .setNegativeButton("إلغاء", null)
             .show()
+
+        startDeviceDiscovery()
     }
 
-    // رادار إعادة الاتصال التلقائي بالجهاز المفضل وإرسال الرسائل المعلقة
-    private fun startAutoReconnect() {
-        if (isAutoReconnecting || favDeviceAddress == null) return
-        isAutoReconnecting = true
-        updateStatus("رادار البحث نشط: بانتظار فتح ($favDeviceName) للبلوتوث...")
+    private fun startDeviceDiscovery() {
+        if (bluetoothAdapter?.isDiscovering == true) bluetoothAdapter?.cancelDiscovery()
+        bluetoothAdapter?.startDiscovery()
+    }
 
-        val runnable = object : Runnable {
-            override fun run() {
-                if (connectedThread != null) {
-                    isAutoReconnecting = false
-                    return
+    private fun registerBluetoothReceiver() {
+        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
+        registerReceiver(object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (BluetoothDevice.ACTION_FOUND == intent.action) {
+                    val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                    if (device != null && !discoveredDeviceList.contains(device)) {
+                        discoveredDeviceList.add(device)
+                        discoveredDeviceNames.add("📡 متاح: ${device.name ?: "جهاز"} (${device.address})")
+                        if (::discoveryAdapter.isInitialized) discoveryAdapter.notifyDataSetChanged()
+                    }
                 }
-                val device = bluetoothAdapter?.bondedDevices?.find { it.address == favDeviceAddress }
-                if (device != null && bluetoothAdapter?.isEnabled == true) {
-                    connectThread?.cancel()
-                    connectThread = ConnectThread(device, isSilentRetry = true).also { it.start() }
+            }
+        }, filter)
+    }
+
+    private fun connectToDevice(device: BluetoothDevice) {
+        connectThread?.cancel()
+        connectThread = ConnectThread(device).also { it.start() }
+        updateStatus("جاري الاتصال بـ ${device.name}...")
+    }
+
+    private fun startServer() {
+        acceptThread?.cancel()
+        acceptThread = AcceptThread().also { it.start() }
+        updateStatus("الغرفة مفتوحة بانتظار انضمام الأصدقاء 🏠")
+    }
+
+    private fun updateStatus(msg: String) {
+        runOnUiThread { tvStatus.text = "الحالة: $msg" }
+    }
+
+    private fun broadcastPacket(type: Byte, fileName: String, bytes: ByteArray) {
+        for (ct in clientThreads) ct.sendPacket(type, myDeviceName, fileName, bytes)
+        hostClientThread?.sendPacket(type, myDeviceName, fileName, bytes)
+    }
+
+    private inner class AcceptThread : Thread() {
+        private val serverSocket: BluetoothServerSocket? by lazy(LazyThreadSafetyMode.NONE) {
+            bluetoothAdapter?.listenUsingRfcommWithServiceRecord(APP_NAME, APP_UUID)
+        }
+
+        override fun run() {
+            while (true) {
+                val socket = try { serverSocket?.accept() } catch (e: IOException) { break }
+                if (socket != null) {
+                    val ct = ConnectedThread(socket, socket.remoteDevice.name ?: "عضو")
+                    clientThreads.add(ct)
+                    ct.start()
+                    updateStatus("انضم عضو جديد للغرفة! (${clientThreads.size} أعضاء)")
                 }
-                if (isAutoReconnecting) {
-                    reconnectHandler.postDelayed(this, 6000)
+            }
+        }
+        fun cancel() { try { serverSocket?.close() } catch (e: IOException) {} }
+    }
+
+    private inner class ConnectThread(private val device: BluetoothDevice) : Thread() {
+        private val socket: BluetoothSocket? by lazy(LazyThreadSafetyMode.NONE) {
+            device.createRfcommSocketToServiceRecord(APP_UUID)
+        }
+
+        override fun run() {
+            bluetoothAdapter?.cancelDiscovery()
+            try {
+                socket?.connect()
+                socket?.let {
+                    hostClientThread = ConnectedThread(it, device.name ?: "المضيف").also { t -> t.start() }
+                    updateStatus("متصل بنجاح مع غرفة: ${device.name}")
+                }
+            } catch (e: IOException) {
+                updateStatus("فشل الاتصال بالغرفة")
+                try { socket?.close() } catch (ce: IOException) {}
+            }
+        }
+        fun cancel() { try { socket?.close() } catch (e: IOException) {} }
+    }
+
+    private inner class ConnectedThread(private val socket: BluetoothSocket, private val peerName: String) : Thread() {
+        private val dataIn = DataInputStream(BufferedInputStream(socket.inputStream))
+        private val dataOut = DataOutputStream(BufferedOutputStream(socket.outputStream))
+
+        override fun run() {
+            while (true) {
+                try {
+                    val type = dataIn.readByte()
+                    val senderName = dataIn.readUTF()
+                    val fileName = dataIn.readUTF()
+                    val size = dataIn.readInt()
+                    val payload = ByteArray(size)
+                    dataIn.readFully(payload)
+
+                    if (acceptThread != null && clientThreads.contains(this)) {
+                        for (ct in clientThreads) {
+                            if (ct != this) ct.sendPacket(type, senderName, fileName, payload)
+                        }
+                    }
+
+                    when (type) {
+                        TYPE_TEXT -> {
+                            val text = String(payload, Charsets.UTF_8)
+                            handleIncomingMessage(senderName, text, isImage = false) {
+                                addMessageBubble(senderName, text, isSentByMe = false)
+                            }
+                        }
+                        TYPE_IMAGE -> {
+                            handleIncomingMessage(senderName, "صورة", isImage = true) {
+                                addImageBubble(senderName, payload, isSentByMe = false)
+                            }
+                        }
+                        TYPE_AUDIO -> {
+                            val audioFile = File(externalCacheDir, "rx_${System.currentTimeMillis()}.m4a")
+                            audioFile.writeBytes(payload)
+                            handleIncomingMessage(senderName, "رسالة صوتية", isImage = false) {
+                                addAudioBubble(senderName, audioFile.absolutePath, isSentByMe = false)
+                            }
+                        }
+                        TYPE_FILE -> {
+                            val saved = saveToDownloads(fileName, payload)
+                            handleIncomingMessage(senderName, "ملف: $fileName", isImage = false) {
+                                addMessageBubble(senderName, "📁 استلمت ملفاً: $fileName\n(حُفظ في $saved)", isSentByMe = false)
+                            }
+                        }
+                    }
+                } catch (e: IOException) {
+                    clientThreads.remove(this)
+                    if (hostClientThread == this) hostClientThread = null
+                    updateStatus("انقطع الاتصال مع $peerName")
+                    break
                 }
             }
         }
-        reconnectHandler.post(runnable)
+
+        @Synchronized
+        fun sendPacket(type: Byte, sender: String, fileName: String, bytes: ByteArray) {
+            Thread {
+                try {
+                    synchronized(dataOut) {
+                        dataOut.writeByte(type.toInt())
+                        dataOut.writeUTF(sender)
+                        dataOut.writeUTF(fileName)
+                        dataOut.writeInt(bytes.size)
+                        dataOut.write(bytes)
+                        dataOut.flush()
+                    }
+                } catch (e: IOException) {}
+            }.start()
+        }
+
+        fun cancel() { try { socket.close() } catch (e: IOException) {} }
     }
 
-    private fun flushPendingQueue() {
-        Thread {
-            while (pendingQueue.isNotEmpty() && connectedThread != null) {
-                val pkt = pendingQueue.poll() ?: break
-                connectedThread?.sendPacket(pkt.type, pkt.fileName, pkt.bytes)
-                Thread.sleep(300)
+    // منطق الإشعارات الذكي: صوت بيب ناعم إذا كان داخل التطبيق، أو إشعار خارجي إذا كان خارجه
+    private fun handleIncomingMessage(sender: String, summary: String, isImage: Boolean, action: () -> Unit) {
+        runOnUiThread {
+            action()
+            if (isAppInForeground) {
+                // تشغيل صوت "بيب" ناعم جداً وبسيط مثل واتساب
+                try {
+                    val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 30)
+                    tone.startTone(ToneGenerator.TONE_PROP_BEEP, 80)
+                } catch (e: Exception) {}
+            } else {
+                // خارج التطبيق: إظهار إشعار رسمي في شريط الهاتف
+                showSystemNotification("رسالة من $sender 💬", summary)
             }
-            runOnUiThread {
-                Toast.makeText(this, "تم تسليم جميع الرسائل المعلقة بنجاح!", Toast.LENGTH_SHORT).show()
-            }
-        }.start()
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "تنبيهات رسائل البلوتوث",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "إشعارات الرسائل الجديدة وانقطاع الاتصال"
-                enableVibration(true)
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
         }
-    }
-
-    private fun showSystemNotification(title: String, content: String) {
-        val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
-        val pendingIntent = PendingIntent.getActivity(this, 0, intent, flags)
-
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            Notification.Builder(this)
-        }
-
-        builder.setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle(title)
-            .setContentText(content)
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
-
-        val manager = getSystemService(NotificationManager::class.java)
-        manager?.notify((System.currentTimeMillis() % 10000).toInt(), builder.build())
-    }
-
-    private fun requestAppPermissions(): Boolean {
-        val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
-            needed.add(Manifest.permission.BLUETOOTH_SCAN)
-            needed.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            needed.add("android.permission.POST_NOTIFICATIONS")
-        }
-        val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) {
-            requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
-            return false
-        }
-        return true
     }
 
     private fun startAudioRecording() {
@@ -450,11 +521,9 @@ class MainActivity : Activity() {
                 start()
             }
             isRecording = true
-            btnRecordAudio.text = "⏹️ إرسال الصوت"
-            btnRecordAudio.background = createRoundedBg("#DC2626")
-        } catch (e: Exception) {
-            Toast.makeText(this, "تعذر بدء التسجيل: ${e.message}", Toast.LENGTH_SHORT).show()
-        }
+            btnRecordAudio.text = "⏹️ إيقاف وإرسال"
+            btnRecordAudio.background = createGlassBackground("#DC2626", 18f)
+        } catch (e: Exception) {}
     }
 
     private fun stopAndSendAudio() {
@@ -462,23 +531,16 @@ class MainActivity : Activity() {
             mediaRecorder?.apply { stop(); release() }
             mediaRecorder = null
             isRecording = false
-            btnRecordAudio.text = "🎤 تسجيل صوت"
-            btnRecordAudio.background = createRoundedBg("#EC4899")
+            btnRecordAudio.text = "🎤 صوت"
+            btnRecordAudio.background = createGlassBackground("#DB2777", 18f)
 
             val file = File(audioFilePath)
             if (file.exists()) {
                 val bytes = file.readBytes()
-                if (connectedThread != null) {
-                    connectedThread?.sendPacket(TYPE_AUDIO, file.name, bytes)
-                } else {
-                    pendingQueue.add(QueuedPacket(TYPE_AUDIO, file.name, bytes))
-                    startAutoReconnect()
-                }
-                addAudioBubble(file.absolutePath, isSentByMe = true)
+                broadcastPacket(TYPE_AUDIO, file.name, bytes)
+                addAudioBubble(myDeviceName, file.absolutePath, isSentByMe = true)
             }
-        } catch (e: Exception) {
-            Toast.makeText(this, "خطأ في حفظ الصوت", Toast.LENGTH_SHORT).show()
-        }
+        } catch (e: Exception) {}
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -490,78 +552,67 @@ class MainActivity : Activity() {
             try {
                 if (requestCode == REQ_PICK_IMAGE) {
                     val input = contentResolver.openInputStream(uri)
-                    val originalBitmap = BitmapFactory.decodeStream(input)
+                    val original = BitmapFactory.decodeStream(input)
                     input?.close()
 
-                    val maxDim = 900
-                    val ratio = minOf(maxDim.toFloat() / originalBitmap.width, maxDim.toFloat() / originalBitmap.height, 1f)
-                    val scaledBitmap = Bitmap.createScaledBitmap(
-                        originalBitmap,
-                        (originalBitmap.width * ratio).toInt(),
-                        (originalBitmap.height * ratio).toInt(),
-                        true
-                    )
+                    val maxDim = 800
+                    val ratio = minOf(maxDim.toFloat() / original.width, maxDim.toFloat() / original.height, 1f)
+                    val scaled = Bitmap.createScaledBitmap(original, (original.width * ratio).toInt(), (original.height * ratio).toInt(), true)
                     val out = ByteArrayOutputStream()
-                    scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 75, out)
+                    scaled.compress(Bitmap.CompressFormat.JPEG, 75, out)
                     val bytes = out.toByteArray()
 
-                    if (connectedThread != null) {
-                        connectedThread?.sendPacket(TYPE_IMAGE, "IMG_${System.currentTimeMillis()}.jpg", bytes)
-                    } else {
-                        pendingQueue.add(QueuedPacket(TYPE_IMAGE, "IMG_${System.currentTimeMillis()}.jpg", bytes))
-                        runOnUiThread { startAutoReconnect() }
-                    }
-                    addImageBubble(bytes, isSentByMe = true)
-
+                    broadcastPacket(TYPE_IMAGE, "IMG_${System.currentTimeMillis()}.jpg", bytes)
+                    addImageBubble(myDeviceName, bytes, isSentByMe = true)
                 } else if (requestCode == REQ_PICK_FILE) {
                     val fileName = getFileNameFromUri(uri)
                     val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@Thread
-                    if (connectedThread != null) {
-                        connectedThread?.sendPacket(TYPE_FILE, fileName, bytes)
-                    } else {
-                        pendingQueue.add(QueuedPacket(TYPE_FILE, fileName, bytes))
-                        runOnUiThread { startAutoReconnect() }
-                    }
-                    addTextBubble("📎 ملف: $fileName", isSentByMe = true)
+                    broadcastPacket(TYPE_FILE, fileName, bytes)
+                    addMessageBubble(myDeviceName, "📎 أرسلت ملفاً: $fileName", isSentByMe = true)
                 }
-            } catch (e: Exception) {
-                runOnUiThread { Toast.makeText(this, "فشل قراءة الملف", Toast.LENGTH_SHORT).show() }
-            }
+            } catch (e: Exception) {}
         }.start()
     }
 
     private fun getFileNameFromUri(uri: Uri): String {
         var name = "file_${System.currentTimeMillis()}"
         contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (cursor.moveToFirst() && index >= 0) name = cursor.getString(index)
+            val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (cursor.moveToFirst() && idx >= 0) name = cursor.getString(idx)
         }
         return name
     }
 
-    private fun createBaseBubble(isSentByMe: Boolean): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = if (isSentByMe) Gravity.END else Gravity.START
-                setMargins(10, 10, 10, 10)
-            }
-            setPadding(28, 20, 28, 20)
-            background = createRoundedBg(if (isSentByMe) "#2563EB" else "#334155")
-        }
-    }
-
-    private fun addTextBubble(message: String, isSentByMe: Boolean) {
+    private fun addMessageBubble(sender: String, message: String, isSentByMe: Boolean) {
         runOnUiThread {
-            val bubble = createBaseBubble(isSentByMe)
+            val bubble = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = if (isSentByMe) Gravity.END else Gravity.START
+                    setMargins(8, 8, 8, 8)
+                }
+                setPadding(24, 16, 24, 16)
+                background = createGlassBackground(if (isSentByMe) "#1E3A8A" else "#1E293B", 22f)
+            }
+
+            val tvSender = TextView(this).apply {
+                text = if (isSentByMe) "أنت" else sender
+                setTextColor(Color.parseColor("#38BDF8"))
+                textSize = 12f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            }
+
             val tvMsg = TextView(this).apply {
                 text = message
                 setTextColor(Color.WHITE)
-                textSize = 16f
+                textSize = 15f
+                setPadding(0, 4, 0, 4)
             }
+
+            bubble.addView(tvSender)
             bubble.addView(tvMsg)
             bubble.addView(createTimeLabel())
             chatContainer.addView(bubble)
@@ -569,16 +620,37 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun addImageBubble(imageBytes: ByteArray, isSentByMe: Boolean) {
+    private fun addImageBubble(sender: String, bytes: ByteArray, isSentByMe: Boolean) {
         runOnUiThread {
-            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: return@runOnUiThread
-            val bubble = createBaseBubble(isSentByMe)
-            val iv = ImageView(this).apply {
-                setImageBitmap(bitmap)
-                adjustViewBounds = true
-                maxWidth = 600
-                maxHeight = 600
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@runOnUiThread
+            val bubble = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = if (isSentByMe) Gravity.END else Gravity.START
+                    setMargins(8, 8, 8, 8)
+                }
+                setPadding(20, 14, 20, 14)
+                background = createGlassBackground(if (isSentByMe) "#1E3A8A" else "#1E293B", 22f)
             }
+
+            val tvSender = TextView(this).apply {
+                text = if (isSentByMe) "أنت" else sender
+                setTextColor(Color.parseColor("#38BDF8"))
+                textSize = 12f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            }
+
+            val iv = ImageView(this).apply {
+                setImageBitmap(bmp)
+                adjustViewBounds = true
+                maxWidth = 550
+                maxHeight = 550
+            }
+
+            bubble.addView(tvSender)
             bubble.addView(iv)
             bubble.addView(createTimeLabel())
             chatContainer.addView(bubble)
@@ -586,21 +658,40 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun addAudioBubble(filePath: String, isSentByMe: Boolean) {
+    private fun addAudioBubble(sender: String, path: String, isSentByMe: Boolean) {
         runOnUiThread {
-            val bubble = createBaseBubble(isSentByMe)
+            val bubble = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = if (isSentByMe) Gravity.END else Gravity.START
+                    setMargins(8, 8, 8, 8)
+                }
+                setPadding(20, 14, 20, 14)
+                background = createGlassBackground(if (isSentByMe) "#1E3A8A" else "#1E293B", 22f)
+            }
+
+            val tvSender = TextView(this).apply {
+                text = if (isSentByMe) "أنت" else sender
+                setTextColor(Color.parseColor("#38BDF8"))
+                textSize = 12f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            }
+
             val btnPlay = Button(this).apply {
-                text = "▶️ تشغيل الرسالة الصوتية"
+                text = "▶️ تشغيل التسجيل الصوتي"
                 setTextColor(Color.WHITE)
-                background = createRoundedBg("#0D9488")
+                background = createGlassBackground("#0F766E", 16f)
                 setOnClickListener {
                     try {
-                        MediaPlayer().apply { setDataSource(filePath); prepare(); start() }
-                    } catch (e: Exception) {
-                        Toast.makeText(this@MainActivity, "تعذر تشغيل الصوت", Toast.LENGTH_SHORT).show()
-                    }
+                        MediaPlayer().apply { setDataSource(path); prepare(); start() }
+                    } catch (e: Exception) {}
                 }
             }
+
+            bubble.addView(tvSender)
             bubble.addView(btnPlay)
             bubble.addView(createTimeLabel())
             chatContainer.addView(bubble)
@@ -612,10 +703,10 @@ class MainActivity : Activity() {
         val time = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
         return TextView(this).apply {
             text = time
-            setTextColor(Color.parseColor("#CBD5E1"))
-            textSize = 11f
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 10f
             gravity = Gravity.END
-            setPadding(0, 8, 0, 0)
+            setPadding(0, 4, 0, 0)
         }
     }
 
@@ -646,189 +737,68 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startServer() {
-        acceptThread?.cancel()
-        acceptThread = AcceptThread().also { it.start() }
-        updateStatus("بانتظار اتصال الهاتف الآخر...")
-    }
-
-    private fun showPairedDevicesDialog() {
-        val paired = bluetoothAdapter?.bondedDevices
-        if (paired.isNullOrEmpty()) {
-            Toast.makeText(this, "اقترن بالهاتف الآخر من إعدادات البلوتوث أولاً!", Toast.LENGTH_LONG).show()
-            return
-        }
-        val list = paired.toList()
-        val names = list.map { "${it.name ?: "هاتف"} ⭐\n(${it.address})" }.toTypedArray()
-
-        AlertDialog.Builder(this)
-            .setTitle("اختر الهاتف للاتصال وحفظه كمفضل")
-            .setItems(names) { _, which ->
-                val dev = list[which]
-                saveFavoriteDevice(dev.address, dev.name ?: "هاتف صديق")
-                connectThread?.cancel()
-                connectThread = ConnectThread(dev, isSilentRetry = false).also { it.start() }
-                updateStatus("جاري الاتصال بـ ${dev.name}...")
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(CHANNEL_ID, "BlueChat Elite Notifications", NotificationManager.IMPORTANCE_HIGH).apply {
+                enableVibration(true)
             }
-            .setNegativeButton("إلغاء", null)
-            .show()
-    }
-
-    private fun saveFavoriteDevice(address: String, name: String) {
-        favDeviceAddress = address
-        favDeviceName = name
-        prefs.edit().putString("fav_address", address).putString("fav_name", name).apply()
-        updateFavoriteLabel()
-    }
-
-    private fun manageConnectedSocket(socket: BluetoothSocket, device: BluetoothDevice) {
-        val name = device.name ?: "هاتف متصل"
-        saveFavoriteDevice(device.address, name)
-        isAutoReconnecting = false
-
-        connectedThread?.cancel()
-        connectedThread = ConnectedThread(socket, name).also { it.start() }
-        updateStatus("متصل الآن مع: $name")
-        showSystemNotification("تم الاتصال عبر البلوتوث ✅", "أنت متصل الآن مع $name ويمكنك تبادل الرسائل")
-
-        if (pendingQueue.isNotEmpty()) {
-            flushPendingQueue()
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
         }
     }
 
-    private fun updateStatus(msg: String) {
-        runOnUiThread { tvStatus.text = "الحالة: $msg" }
+    private fun showSystemNotification(title: String, body: String) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val pi = PendingIntent.getActivity(this, 0, intent, flags)
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            Notification.Builder(this)
+        }
+
+        builder.setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+
+        getSystemService(NotificationManager::class.java)?.notify((System.currentTimeMillis() % 10000).toInt(), builder.build())
     }
 
-    private inner class AcceptThread : Thread() {
-        private val serverSocket: BluetoothServerSocket? by lazy(LazyThreadSafetyMode.NONE) {
-            bluetoothAdapter?.listenUsingRfcommWithServiceRecord(APP_NAME, APP_UUID)
+    private fun requestAppPermissions(): Boolean {
+        val needed = mutableListOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            needed.add(Manifest.permission.BLUETOOTH_ADVERTISE)
         }
-
-        override fun run() {
-            while (true) {
-                val socket = try { serverSocket?.accept() } catch (e: IOException) { break }
-                if (socket != null) {
-                    manageConnectedSocket(socket, socket.remoteDevice)
-                    serverSocket?.close()
-                    break
-                }
-            }
+        if (Build.VERSION.SDK_INT >= 33) {
+            needed.add("android.permission.POST_NOTIFICATIONS")
         }
-
-        fun cancel() {
-            try { serverSocket?.close() } catch (e: IOException) {}
+        val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
+            return false
         }
-    }
-
-    private inner class ConnectThread(
-        private val device: BluetoothDevice,
-        private val isSilentRetry: Boolean
-    ) : Thread() {
-        private val socket: BluetoothSocket? by lazy(LazyThreadSafetyMode.NONE) {
-            device.createRfcommSocketToServiceRecord(APP_UUID)
-        }
-
-        override fun run() {
-            bluetoothAdapter?.cancelDiscovery()
-            try {
-                socket?.connect()
-                socket?.let { manageConnectedSocket(it, device) }
-            } catch (e: IOException) {
-                if (!isSilentRetry) {
-                    updateStatus("الجهاز غير متصل حالياً - يمكنك إرسال رسائل بالانتظار")
-                }
-                try { socket?.close() } catch (ce: IOException) {}
-            }
-        }
-
-        fun cancel() {
-            try { socket?.close() } catch (e: IOException) {}
-        }
-    }
-
-    private inner class ConnectedThread(
-        private val socket: BluetoothSocket,
-        private val peerName: String
-    ) : Thread() {
-        private val dataIn = DataInputStream(BufferedInputStream(socket.inputStream))
-        private val dataOut = DataOutputStream(BufferedOutputStream(socket.outputStream))
-
-        override fun run() {
-            while (true) {
-                try {
-                    val type = dataIn.readByte()
-                    val fileName = dataIn.readUTF()
-                    val size = dataIn.readInt()
-                    val payload = ByteArray(size)
-                    dataIn.readFully(payload)
-
-                    when (type) {
-                        TYPE_TEXT -> {
-                            val text = String(payload, Charsets.UTF_8)
-                            addTextBubble(text, isSentByMe = false)
-                            showSystemNotification("رسالة جديدة من $peerName 💬", text)
-                        }
-                        TYPE_IMAGE -> {
-                            addImageBubble(payload, isSentByMe = false)
-                            showSystemNotification("صورة جديدة من $peerName 📷", "افتح التطبيق لمشاهدة الصورة")
-                        }
-                        TYPE_AUDIO -> {
-                            val tempAudio = File(externalCacheDir, "rx_${System.currentTimeMillis()}.m4a")
-                            tempAudio.writeBytes(payload)
-                            addAudioBubble(tempAudio.absolutePath, isSentByMe = false)
-                            showSystemNotification("رسالة صوتية من $peerName 🎤", "افتح التطبيق للاستماع للتسجيل")
-                        }
-                        TYPE_FILE -> {
-                            val savedPath = saveToDownloads(fileName, payload)
-                            addTextBubble("📁 استلمت ملفاً: $fileName\nحُفظ في: $savedPath", isSentByMe = false)
-                            showSystemNotification("ملف مستلم من $peerName 📎", "تم حفظ $fileName في التنزيلات")
-                        }
-                    }
-                } catch (e: IOException) {
-                    connectedThread = null
-                    updateStatus("انقطع الاتصال مع $peerName")
-                    showSystemNotification(
-                        "⚠️ انقطع اتصال البلوتوث مع $peerName",
-                        "يرجى التأكد من تشغيل البلوتوث والاقتران لاستلام الرسائل الجديدة"
-                    )
-                    // إعادة تفعيل الاستماع تلقائياً لاستقبال اتصال الطرف الآخر فور عودته
-                    startServer()
-                    break
-                }
-            }
-        }
-
-        @Synchronized
-        fun sendPacket(type: Byte, fileName: String, bytes: ByteArray) {
-            Thread {
-                try {
-                    synchronized(dataOut) {
-                        dataOut.writeByte(type.toInt())
-                        dataOut.writeUTF(fileName)
-                        dataOut.writeInt(bytes.size)
-                        dataOut.write(bytes)
-                        dataOut.flush()
-                    }
-                } catch (e: IOException) {
-                    updateStatus("فشل الإرسال - تم نقل الرسالة لطابور الانتظار")
-                    pendingQueue.add(QueuedPacket(type, fileName, bytes))
-                    startAutoReconnect()
-                }
-            }.start()
-        }
-
-        fun cancel() {
-            try { socket.close() } catch (e: IOException) {}
-        }
+        return true
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        isAutoReconnecting = false
-        reconnectHandler.removeCallbacksAndMessages(null)
         acceptThread?.cancel()
         connectThread?.cancel()
-        connectedThread?.cancel()
+        clientThreads.forEach { it.cancel() }
+        hostClientThread?.cancel()
     }
 }
